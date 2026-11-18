@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+aws/lab.env
+aws/.state
+aws/.state.*
+aws/.known_hosts
+aws/.known_hosts.legacy
