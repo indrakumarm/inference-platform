@@ -34,7 +34,7 @@ certificate and received `401` without a bearer token. A local NGINX test
 with a mock backend also verified authenticated streaming and that the token
 was not forwarded upstream. If not already done on the live `443` listener,
 verify both a `401` without a token and a stream ending in `[DONE]` with it.
-See the [HTTPS setup and smoke test](../README.md#https-and-bearer-authentication-for-vpn-clients).
+See the [HTTPS setup and smoke test](gateway.md#https-and-bearer-authentication-for-vpn-clients).
 
 ## Future implementation: independent token management
 
