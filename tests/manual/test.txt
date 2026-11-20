@@ -1,0 +1,55 @@
+Direct vllm endpoint:
+--------------------
+1) DIRECT=http://127.0.0.1:8000
+MODEL=$(curl -fsS "$DIRECT/v1/models" | jq -er '.data[0].id')
+echo "$MODEL"
+
+jq -n --arg model "$MODEL" '{
+  model: $model,
+  messages: [{role: "user", content: "Explain prefill versus decode in three short bullets."}],
+  temperature: 0,
+  max_tokens: 256
+}' > /tmp/inference-request.json
+
+ cat /tmp/inference-request.json
+{
+  "model": "Qwen/Qwen3-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain prefill versus decode in three short bullets."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 256
+}
+
+
+2
+cat !$
+cat /tmp/inference-stream.json
+{
+  "model": "Qwen/Qwen3-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain prefill versus decode in three short bullets."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 1024,
+  "stream": true
+}
+(.pvenv) bash-3.2$ cat /tmp/inference-request.json 
+{
+  "model": "Qwen/Qwen3-8B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain prefill versus decode in three short bullets."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 256
+}
+

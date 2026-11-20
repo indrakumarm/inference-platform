@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.request import Request
 from unittest.mock import Mock, patch
 
-from inference_platform import cli, remote_deploy
+from inference_platform import cli, remote_deploy, remote_monitoring
 from inference_platform.deployment import deployment_blockers, parse_profile
 from inference_platform.ssh import SSHHost
 
@@ -64,6 +64,29 @@ def host_report():
 
 
 class ProfileTests(unittest.TestCase):
+    def test_private_binding_is_optional_and_rejects_non_private_addresses(self):
+        self.assertIsNone(parse_profile(profile_data()).private_bind_ip)
+        for address in ("0.0.0.0", "127.0.0.1", "8.8.8.8", "::1", "gpu.internal"):
+            with self.subTest(address=address), self.assertRaisesRegex(ValueError, "private_bind_ip"):
+                parse_profile({**profile_data(), "private_bind_ip": address})
+
+    def test_preflight_reports_private_binding_failure(self):
+        data = {**profile_data(), "private_bind_ip": "10.0.1.10"}
+        facts = {**deployment_facts(), "private_bind_error": "address not assigned"}
+        expected = ["Cannot bind 10.0.1.10:8000: address not assigned"]
+        self.assertEqual(deployment_blockers(facts, parse_profile(data)), expected)
+        self.assertEqual(remote_deploy.blockers(facts, data), expected)
+
+    def test_preflight_reports_available_and_required_disk_space(self):
+        profile = parse_profile(profile_data())
+        facts = deployment_facts()
+        facts["free_disk_bytes"] = int(38.25 * 1024**3)
+        self.assertEqual(deployment_blockers(facts, profile), [
+            "Free space on /: 38.25 GiB available; 40 GiB required (min_free_disk_gib).",
+        ])
+        facts["free_disk_bytes"] = 40 * 1024**3
+        self.assertEqual(deployment_blockers(facts, profile), [])
+
     def test_requires_immutable_image_and_model_revisions(self):
         data = profile_data()
         self.assertEqual(parse_profile(data).gpu_indices, [0])
@@ -102,6 +125,47 @@ class ProfileTests(unittest.TestCase):
 
 
 class DeploymentWorkflowTests(unittest.TestCase):
+    def test_file_discovery_updates_follow_successful_lifecycle_actions(self):
+        data = {**profile_data(), "private_bind_ip": "10.0.1.10"}
+        stopped = {"name": "inference-small-model", "exists": True, "state": "exited",
+                   "running": False, "exit_code": 0, "error": "", "finished_at": "now"}
+        for operation, fail_deploy, absent in (
+            ("deploy", False, False), ("deploy", True, False),
+            ("remove", False, False), ("remove", False, True),
+        ):
+            with self.subTest(operation=operation, fail_deploy=fail_deploy, absent=absent), \
+                    tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "profile.json"
+                path.write_text(json.dumps(data))
+                workflow = Mock()
+                gpu, monitor = workflow.gpu, workflow.monitor
+                gpu.inspect.return_value = host_report()
+                gpu.deployment_inspect.return_value = {**deployment_facts(), "private_bind_error": ""}
+                gpu.deploy.return_value = {"model": "org/model", "endpoint": "http://127.0.0.1:8000/v1"}
+                if fail_deploy:
+                    gpu.deploy.side_effect = RuntimeError("model not ready")
+                status = {**stopped, "exists": False} if absent else stopped
+                gpu.lifecycle.side_effect = [status, status, {"name": stopped["name"]}]
+                answer = "deploy ubuntu@gpu.example small-model" if operation == "deploy" else "yes"
+                with patch("inference_platform.cli.SSHHost", side_effect=[monitor, gpu]), \
+                        patch("inference_platform.cli.sys.stdin.isatty", return_value=True), \
+                        patch("builtins.input", return_value=answer), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    result = cli.main([operation, "--host", "ubuntu@gpu.example",
+                                       "--profile", str(path), "--monitoring-host", "metrics@monitor.example"])
+                self.assertEqual(result, int(fail_deploy))
+                if fail_deploy:
+                    monitor.update_monitoring_target.assert_not_called()
+                else:
+                    monitor.update_monitoring_target.assert_called_once_with(
+                        "add" if operation == "deploy" else "remove", "10.0.1.10", 8000, "small-model")
+                    preceding = ("gpu.deploy" if operation == "deploy" else "gpu.lifecycle")
+                    self.assertEqual([call[0] for call in workflow.mock_calls][-2:],
+                                     [preceding, "monitor.update_monitoring_target"])
+                    if operation == "remove":
+                        self.assertEqual(gpu.lifecycle.call_count, 2 if absent else 3)
+
     def run_cli(self, confirmation):
         host = Mock()
         host.inspect.return_value = host_report()
@@ -214,20 +278,35 @@ class DeploymentWorkflowTests(unittest.TestCase):
         self.assertEqual(host.lifecycle.call_args_list[0].args[0], "status")
         self.assertIn("State: running", output)
 
-    def test_stop_requires_typed_confirmation_and_rechecks_state(self):
+    def test_stop_accepts_yes_and_rechecks_state(self):
         running = {"name": "inference-small-model", "exists": True,
                    "state": "running", "running": True, "started_at": "now",
                    "exit_code": 0, "error": "", "finished_at": ""}
         stopped = {"name": "inference-small-model", "exists": True,
                    "state": "exited", "running": False, "exit_code": 0,
                    "error": "", "finished_at": "now"}
-        code, host, _, output = self.run_lifecycle_cli(
-            "stop", [running, running, stopped],
-            answer="stop ubuntu@gpu.example inference-small-model")
+        code, host, prompt, output = self.run_lifecycle_cli(
+            "stop", [running, running, stopped], answer=" YES ")
         self.assertEqual(code, 0)
+        prompt.assert_called_once_with("Stop inference-small-model on ubuntu@gpu.example? [y/N]: ")
         self.assertEqual([call.args[0] for call in host.lifecycle.call_args_list],
                          ["status", "status", "stop"])
         self.assertIn("State: exited", output)
+
+    def test_start_cancels_without_affirmative_confirmation(self):
+        stopped = {"name": "inference-small-model", "exists": True,
+                   "state": "exited", "running": False, "exit_code": 0,
+                   "error": "", "finished_at": "now"}
+        for answer in ("no", "", "maybe"):
+            with self.subTest(answer=answer):
+                code, host, prompt, output = self.run_lifecycle_cli(
+                    "start", [stopped], answer=answer)
+                self.assertEqual(code, 0)
+                prompt.assert_called_once_with(
+                    "Start inference-small-model on ubuntu@gpu.example? [y/N]: ")
+                self.assertEqual([call.args[0] for call in host.lifecycle.call_args_list],
+                                 ["status"])
+                self.assertIn("Cancelled; nothing changed.", output)
 
     def test_remove_refuses_running_container_without_confirmation(self):
         running = {"name": "inference-small-model", "exists": True,
@@ -238,6 +317,23 @@ class DeploymentWorkflowTests(unittest.TestCase):
         prompt.assert_not_called()
         self.assertEqual(host.lifecycle.call_count, 1)
         self.assertIn("Stop the container before removing it", output)
+
+
+class MonitoringTargetTests(unittest.TestCase):
+    def test_multiple_targets_can_be_registered_and_removed_independently(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(remote_monitoring, "TARGET_DIR", Path(directory)):
+            first = {"name": "small-model", "ip": "10.0.1.10", "port": 8000}
+            second = {**first, "ip": "10.0.1.11"}
+            for target in (first, first, second):
+                remote_monitoring.update_target("add", target)
+            self.assertEqual(len(list(Path(directory).iterdir())), 2)
+            remote_monitoring.update_target("remove", first)
+            remote_monitoring.update_target("remove", first)
+            remaining, = Path(directory).glob("vllm-*.json")
+            self.assertEqual(json.loads(remaining.read_text()), [
+                {"targets": ["10.0.1.11:8000"], "labels": {"deployment": "small-model"}},
+            ])
 
 
 class DeploymentTransportTests(unittest.TestCase):
@@ -293,6 +389,18 @@ class DeploymentTransportTests(unittest.TestCase):
 
 
 class RemoteDeploymentTests(unittest.TestCase):
+    def test_launch_adds_the_private_binding_without_replacing_loopback(self):
+        profile = {**profile_data(), "private_bind_ip": "10.0.1.10"}
+        with patch.object(remote_deploy, "deployment_inspect", return_value={
+            **deployment_facts(), "private_bind_error": "",
+        }), patch.object(remote_deploy, "docker_prefix", return_value=[]), \
+                patch.object(remote_deploy, "run") as run, \
+                patch.object(remote_deploy, "wait_for_model"):
+            remote_deploy.deploy(profile)
+        launch = next(command.args[0] for command in run.call_args_list if "-d" in command.args[0])
+        bindings = [launch[index + 1] for index, value in enumerate(launch) if value == "--publish"]
+        self.assertEqual(bindings, ["127.0.0.1:8000:8000", "10.0.1.10:8000:8000"])
+
     def test_launch_binds_only_loopback_and_uses_selected_gpus_and_pins(self):
         commands = []
         with patch("inference_platform.remote_deploy.deployment_inspect",
@@ -306,6 +414,7 @@ class RemoteDeploymentTests(unittest.TestCase):
                                     "generation_smoke_test": "passed"}):
             result = remote_deploy.deploy(profile_data())
         launch = next(command for command in commands if "run" in command and "-d" in command)
+        self.assertEqual(launch.count("--publish"), 1)
         self.assertIn("127.0.0.1:8000:8000", launch)
         self.assertIn("device=0", launch)
         self.assertIn(profile_data()["image"], launch)
@@ -409,6 +518,22 @@ class RemoteDeploymentTests(unittest.TestCase):
         legacy = deployments[1]
         self.assertEqual(legacy["model"], "unknown (legacy container)")
         self.assertEqual(legacy["metadata_source"], "container-name")
+
+    def test_start_reports_disk_shortfall_without_starting_container(self):
+        stopped = {"name": "inference-small-model", "exists": True,
+                   "state": "exited", "running": False}
+        facts = deployment_facts()
+        facts["target_container_exists"] = True
+        facts["free_disk_bytes"] = int(38.25 * 1024**3)
+        with patch("inference_platform.remote_deploy.container_status", return_value=stopped), \
+                patch("inference_platform.remote_deploy.deployment_inspect", return_value=facts), \
+                patch("inference_platform.remote_deploy.docker_prefix", return_value=[]), \
+                patch("inference_platform.remote_deploy.run") as run:
+            with self.assertRaises(RuntimeError) as error:
+                remote_deploy.manage_container("start", profile_data())
+        self.assertEqual(str(error.exception), "Cannot start container: "
+                         "Free space on /: 38.25 GiB available; 40 GiB required (min_free_disk_gib).")
+        run.assert_not_called()
 
     def test_start_rechecks_dedicated_host_and_removal_requires_stopped(self):
         stopped = {"name": "inference-small-model", "exists": True,

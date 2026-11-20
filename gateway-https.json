@@ -1,0 +1,10 @@
+{
+  "listen": {"host": "10.192.10.244", "port": 443},
+  "backends": [
+    {"host": "127.0.0.1", "port": 8000}
+  ],
+  "max_in_flight": 1,
+  "connect_timeout_seconds": 5,
+  "upstream_read_timeout_seconds": 120,
+  "tls": {"server_name": "inference.example.internal"}
+}

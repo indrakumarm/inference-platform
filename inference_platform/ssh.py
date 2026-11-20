@@ -117,3 +117,26 @@ class SSHHost:
 
     def lifecycle(self, operation, profile):
         return self._deployment_call(operation, profile, timeout=300)
+
+    def update_monitoring_target(self, action, ip, port, name):
+        source = Path(__file__).with_name("remote_monitoring.py").read_text()
+        command = shlex.join(["python3", "-c", source, action])
+        payload = json.dumps({"ip": ip, "port": port, "name": name})
+        logger.info("Updating Prometheus target %s:%s on %s (%s)", ip, port, self.target, action)
+        self._run_ssh(f"monitoring target {action}", command, payload, timeout=30, capture_output=True)
+
+    def gateway_deploy(self, config):
+        self._gateway_call("deploy", config)
+
+    def gateway_bootstrap_tls(self, server_name, token):
+        self._gateway_call("bootstrap-tls", json.dumps({"server_name": server_name, "token": token}))
+
+    def _gateway_call(self, action, payload):
+        source = (Path(__file__).with_name("logging_config.py").read_text() + "\n" +
+                  Path(__file__).with_name("remote_gateway.py").read_text())
+        command = shlex.join([
+            "sudo", "-n", "--", "env", f"INFERENCE_PLATFORM_LOG_LEVEL={self.log_level}",
+            "python3", "-c", source, action,
+        ])
+        logger.info("Starting remote gateway %s on %s", action, self.target)
+        self._run_ssh(f"gateway {action}", command, payload, timeout=120, stdout=subprocess.PIPE)

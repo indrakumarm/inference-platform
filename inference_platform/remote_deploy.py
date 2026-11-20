@@ -1,5 +1,6 @@
 """Self-contained remote deployment payload; requires only the host's Python 3."""
 import csv
+import ipaddress
 import json
 import logging
 import os
@@ -18,6 +19,9 @@ CACHE_VOLUME = "inference-platform-huggingface"
 IMAGE_RE = re.compile(r"(?:docker\.io/)?vllm/vllm-openai@sha256:[0-9a-f]{64}\Z")
 MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*\Z")
 REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
+PRIVATE_NETWORKS = tuple(ipaddress.ip_network(network) for network in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+))
 logger = logging.getLogger(__name__)
 
 
@@ -50,14 +54,29 @@ def probe(command):
                 "stdout": "", "stderr": str(error)}
 
 
+def validate_private_bind_ip(value):
+    if value is None:
+        return
+    if isinstance(value, str):
+        try:
+            address = ipaddress.IPv4Address(value)
+        except ipaddress.AddressValueError:
+            pass
+        else:
+            if any(address in network for network in PRIVATE_NETWORKS):
+                return
+    raise ValueError("private_bind_ip must be a specific RFC 1918 IPv4 address or null")
+
+
 def validate(profile):
     required = {
         "name", "image", "model", "model_revision", "tokenizer", "tokenizer_revision",
         "gpu_indices", "min_gpu_memory_gib", "min_free_disk_gib", "max_model_len",
         "dtype", "gpu_memory_utilization", "port", "shm_size_gib",
     }
-    if not isinstance(profile, dict) or set(profile) != required:
+    if not isinstance(profile, dict) or set(profile) - {"private_bind_ip"} != required:
         raise ValueError("Invalid deployment profile fields")
+    validate_private_bind_ip(profile.get("private_bind_ip"))
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,39}", profile["name"]):
         raise ValueError("Invalid deployment name")
     if not IMAGE_RE.fullmatch(profile["image"]):
@@ -87,6 +106,15 @@ def docker_prefix():
     return None
 
 
+def check_bind(host, port):
+    try:
+        with socket.socket() as listener:
+            listener.bind((host, port))
+    except OSError as error:
+        return str(error)
+    return ""
+
+
 def deployment_inspect(profile):
     logger.info("Collecting deployment preflight facts")
     validate(profile)
@@ -114,18 +142,16 @@ def deployment_inspect(profile):
     all_containers = probe((prefix or []) + DOCKER + ["ps", "-a", "--format", "{{.Names}}"]) if prefix is not None else {
         "code": 1, "stdout": "", "stderr": "root or passwordless sudo is required"}
     try:
-        free_disk_bytes = os.statvfs("/").f_bavail * os.statvfs("/").f_frsize
+        disk = os.statvfs("/")
+        free_disk_bytes = disk.f_bavail * disk.f_frsize
     except OSError as error:
         free_disk_bytes = 0
         disk_error = str(error)
     else:
         disk_error = ""
-    try:
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1", profile["port"]))
-        port_available = True
-    except OSError:
-        port_available = False
+    port_available = not check_bind("127.0.0.1", profile["port"])
+    private_ip = profile.get("private_bind_ip")
+    private_bind_error = check_bind(private_ip, profile["port"]) if private_ip else ""
     return {
         "docker_ready": info["code"] == 0,
         "docker_error": info["stderr"],
@@ -143,7 +169,27 @@ def deployment_inspect(profile):
         "free_disk_bytes": free_disk_bytes,
         "disk_error": disk_error,
         "port_available": port_available,
+        "private_bind_error": private_bind_error,
     }
+
+
+def disk_space_blocker(facts, minimum_gib):
+    if facts["disk_error"]:
+        return "Cannot query free disk space: " + facts["disk_error"]
+    free_bytes = facts["free_disk_bytes"]
+    if free_bytes < minimum_gib * 1024**3:
+        return (f"Free space on /: {free_bytes / 1024**3:.2f} GiB available; "
+                f"{minimum_gib} GiB required (min_free_disk_gib).")
+    return None
+
+
+def port_blockers(facts, port, private_ip):
+    result = []
+    if not facts["port_available"]:
+        result.append(f"Port {port} is unavailable on 127.0.0.1.")
+    if private_ip and facts["private_bind_error"]:
+        result.append(f"Cannot bind {private_ip}:{port}: {facts['private_bind_error']}")
+    return result
 
 
 def blockers(facts, profile, allow_target_container=False):
@@ -170,12 +216,10 @@ def blockers(facts, profile, allow_target_container=False):
         result.append("Running containers exist; deployment requires a dedicated host with no active containers.")
     if facts["target_container_exists"] and not allow_target_container:
         result.append("A container for this deployment name already exists; inspect it before retrying.")
-    if facts["disk_error"]:
-        result.append("Cannot query free disk space: " + facts["disk_error"])
-    elif facts["free_disk_bytes"] < profile["min_free_disk_gib"] * 1024**3:
-        result.append("Free space on / is below min_free_disk_gib in the deployment profile.")
-    if not facts["port_available"]:
-        result.append(f"Port {profile['port']} is unavailable on 127.0.0.1.")
+    disk_blocker = disk_space_blocker(facts, profile["min_free_disk_gib"])
+    if disk_blocker:
+        result.append(disk_blocker)
+    result.extend(port_blockers(facts, profile["port"], profile.get("private_bind_ip")))
     return result
 
 
@@ -256,6 +300,9 @@ def deploy(profile):
     require_ready(profile)
     container = "inference-" + profile["name"]
     run(docker + ["volume", "create", CACHE_VOLUME])
+    publish = ["--publish", f"127.0.0.1:{profile['port']}:8000"]
+    if profile.get("private_bind_ip"):
+        publish.extend(["--publish", f"{profile['private_bind_ip']}:{profile['port']}:8000"])
     command = docker + [
         "run", "-d", "--name", container, "--restart", "unless-stopped",
         "--label", "com.inference-platform.managed=true",
@@ -263,7 +310,7 @@ def deploy(profile):
         "--label", "com.inference-platform.model=" + profile["model"],
         "--label", "com.inference-platform.port=" + str(profile["port"]),
         "--gpus", "device=" + ",".join(map(str, profile["gpu_indices"])),
-        "--publish", f"127.0.0.1:{profile['port']}:8000",
+        *publish,
         "--shm-size", f"{profile['shm_size_gib']}g",
         "--volume", CACHE_VOLUME + ":/root/.cache/huggingface",
         "--env", "HF_HUB_DISABLE_TELEMETRY=1",

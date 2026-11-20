@@ -4,6 +4,8 @@ import logging
 from pathlib import Path
 import re
 
+from .remote_deploy import disk_space_blocker, port_blockers, validate_private_bind_ip
+
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,7 @@ class DeploymentProfile:
     gpu_memory_utilization: float
     port: int
     shm_size_gib: int
+    private_bind_ip: str | None = None
 
     def as_dict(self):
         return asdict(self)
@@ -44,7 +47,7 @@ def parse_profile(data):
     if not isinstance(data, dict):
         raise ValueError("Deployment profile must be a JSON object")
     missing = _PROFILE_FIELDS - data.keys()
-    extra = data.keys() - _PROFILE_FIELDS
+    extra = data.keys() - _PROFILE_FIELDS - {"private_bind_ip"}
     if missing or extra:
         details = []
         if missing:
@@ -86,6 +89,7 @@ def parse_profile(data):
         raise ValueError("port must be an integer between 1024 and 65535")
     if type(data["shm_size_gib"]) is not int or not 1 <= data["shm_size_gib"] <= 128:
         raise ValueError("shm_size_gib must be an integer between 1 and 128")
+    validate_private_bind_ip(data.get("private_bind_ip"))
     return DeploymentProfile(**data)
 
 
@@ -125,9 +129,9 @@ def deployment_blockers(facts, profile):
         blockers.append("Running containers exist; deployment requires a dedicated host with no active containers.")
     if facts["target_container_exists"]:
         blockers.append("A container for this deployment name already exists; inspect it before retrying.")
-    if facts["free_disk_bytes"] < profile.min_free_disk_gib * 1024**3:
-        blockers.append("Free space on / is below min_free_disk_gib in the deployment profile.")
-    if not facts["port_available"]:
-        blockers.append(f"Port {profile.port} is unavailable on 127.0.0.1.")
+    disk_blocker = disk_space_blocker(facts, profile.min_free_disk_gib)
+    if disk_blocker:
+        blockers.append(disk_blocker)
+    blockers.extend(port_blockers(facts, profile.port, profile.private_bind_ip))
     logger.debug("Deployment preflight produced %d blocker(s)", len(blockers))
     return blockers
