@@ -1,0 +1,6 @@
+Once insatnce is up , when infernce_platform start command is exscuted ... it takes good amount of time before vllmendpoint is up ?
+  Factors influencing longer boot up. 
+    1) Vllm image pull (close 12 GB )
+    2) Model pull
+    3) Loading the model 
+    

@@ -10,7 +10,9 @@ from unittest.mock import Mock, patch
 
 from inference_platform import cli, remote_deploy, remote_monitoring
 from inference_platform.deployment import deployment_blockers, parse_profile
+from inference_platform.providers.ssh import SSHProvider
 from inference_platform.ssh import SSHHost
+from inference_platform.ubuntu import plan
 
 
 def profile_data():
@@ -61,6 +63,14 @@ def host_report():
                    "docker_info": result("runc nvidia"), "containers": result(),
                    "docker_active": result("active")},
     }
+
+
+def fake_provider():
+    """A mocked provider that still applies the real planner and preflight policy."""
+    host = Mock()
+    host.plan.side_effect = plan
+    host.deployment_blockers.side_effect = deployment_blockers
+    return host
 
 
 class ProfileTests(unittest.TestCase):
@@ -139,6 +149,8 @@ class DeploymentWorkflowTests(unittest.TestCase):
                 path.write_text(json.dumps(data))
                 workflow = Mock()
                 gpu, monitor = workflow.gpu, workflow.monitor
+                gpu.plan.side_effect = plan
+                gpu.deployment_blockers.side_effect = deployment_blockers
                 gpu.inspect.return_value = host_report()
                 gpu.deployment_inspect.return_value = {**deployment_facts(), "private_bind_error": ""}
                 gpu.deploy.return_value = {"model": "org/model", "endpoint": "http://127.0.0.1:8000/v1"}
@@ -147,7 +159,8 @@ class DeploymentWorkflowTests(unittest.TestCase):
                 status = {**stopped, "exists": False} if absent else stopped
                 gpu.lifecycle.side_effect = [status, status, {"name": stopped["name"]}]
                 answer = "deploy ubuntu@gpu.example small-model" if operation == "deploy" else "yes"
-                with patch("inference_platform.cli.SSHHost", side_effect=[monitor, gpu]), \
+                with patch("inference_platform.cli.SSHHost", return_value=monitor), \
+                        patch("inference_platform.cli.create_provider", return_value=gpu), \
                         patch("inference_platform.cli.sys.stdin.isatty", return_value=True), \
                         patch("builtins.input", return_value=answer), \
                         contextlib.redirect_stdout(io.StringIO()), \
@@ -167,7 +180,7 @@ class DeploymentWorkflowTests(unittest.TestCase):
                         self.assertEqual(gpu.lifecycle.call_count, 2 if absent else 3)
 
     def run_cli(self, confirmation):
-        host = Mock()
+        host = fake_provider()
         host.inspect.return_value = host_report()
         host.deployment_inspect.return_value = deployment_facts()
         host.deploy.return_value = {
@@ -178,7 +191,7 @@ class DeploymentWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profile.json"
             path.write_text(json.dumps(profile_data()))
-            with patch("inference_platform.cli.SSHHost", return_value=host), \
+            with patch("inference_platform.cli.create_provider", return_value=host), \
                     patch("inference_platform.cli.sys.stdin.isatty", return_value=True), \
                     patch("builtins.input", return_value=confirmation), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -202,7 +215,7 @@ class DeploymentWorkflowTests(unittest.TestCase):
         self.assertIn("Cancelled; nothing changed.", output)
 
     def test_new_gpu_workload_after_confirmation_blocks_deployment(self):
-        host = Mock()
+        host = fake_provider()
         host.inspect.return_value = host_report()
         busy = deployment_facts()
         busy["gpu_processes"] = ["123 python"]
@@ -211,7 +224,7 @@ class DeploymentWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profile.json"
             path.write_text(json.dumps(profile_data()))
-            with patch("inference_platform.cli.SSHHost", return_value=host), \
+            with patch("inference_platform.cli.create_provider", return_value=host), \
                     patch("inference_platform.cli.sys.stdin.isatty", return_value=True), \
                     patch("builtins.input", return_value="deploy ubuntu@gpu.example small-model"), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -222,14 +235,14 @@ class DeploymentWorkflowTests(unittest.TestCase):
         self.assertIn("GPU compute processes are active", output.getvalue())
 
     def test_unprepared_host_is_not_deployed(self):
-        host = Mock()
+        host = fake_provider()
         host.inspect.return_value = host_report()
         host.inspect.return_value["checks"]["docker_info"]["stdout"] = "runc"
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profile.json"
             path.write_text(json.dumps(profile_data()))
-            with patch("inference_platform.cli.SSHHost", return_value=host), \
+            with patch("inference_platform.cli.create_provider", return_value=host), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
                 code = cli.main(["deploy", "--host", "ubuntu@gpu.example",
                                  "--profile", str(path)])
@@ -243,10 +256,10 @@ class DeploymentWorkflowTests(unittest.TestCase):
              "image": "vllm/vllm-openai@sha256:abc", "ports": "127.0.0.1:8000->8000/tcp",
              "metadata_source": "labels"},
         ]
-        host = Mock()
+        host = fake_provider()
         host.deployment_list.return_value = deployments
         output = io.StringIO()
-        with patch("inference_platform.cli.SSHHost", return_value=host), \
+        with patch("inference_platform.cli.create_provider", return_value=host), \
                 contextlib.redirect_stdout(output):
             code = cli.main(["list", "--host", "ubuntu@gpu.example"])
         self.assertEqual(code, 0)
@@ -255,13 +268,13 @@ class DeploymentWorkflowTests(unittest.TestCase):
         self.assertIn("inference-small-model [running]", output.getvalue())
 
     def run_lifecycle_cli(self, operation, statuses, answer=None, terminal=True):
-        host = Mock()
+        host = fake_provider()
         host.lifecycle.side_effect = statuses
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profile.json"
             path.write_text(json.dumps(profile_data()))
-            with patch("inference_platform.cli.SSHHost", return_value=host), \
+            with patch("inference_platform.cli.create_provider", return_value=host), \
                     patch("inference_platform.cli.sys.stdin.isatty", return_value=terminal), \
                     patch("builtins.input", return_value=answer) as prompt, \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -340,7 +353,7 @@ class DeploymentTransportTests(unittest.TestCase):
     def test_payload_and_profile_are_sent_over_host_key_checked_ssh(self):
         with patch("inference_platform.ssh.subprocess.run") as run:
             run.return_value.stdout = json.dumps(deployment_facts())
-            host = SSHHost("ubuntu@gpu.example")
+            host = SSHProvider(SSHHost("ubuntu@gpu.example"))
             result = host.deployment_inspect(profile_data())
         self.assertTrue(result["docker_ready"])
         command = run.call_args.args[0]
@@ -356,7 +369,7 @@ class DeploymentTransportTests(unittest.TestCase):
                 "model": "org/model",
                 "generation_smoke_test": "passed",
             })
-            host = SSHHost("ubuntu@gpu.example")
+            host = SSHProvider(SSHHost("ubuntu@gpu.example"))
             self.assertEqual(host.deploy(profile_data())["model"], "org/model")
         self.assertEqual(run.call_args.kwargs["stdout"], subprocess.PIPE)
         self.assertNotIn("stderr", run.call_args.kwargs)
@@ -365,7 +378,7 @@ class DeploymentTransportTests(unittest.TestCase):
     def test_list_sends_inventory_request_without_a_profile(self):
         with patch("inference_platform.ssh.subprocess.run") as run:
             run.return_value.stdout = "[]"
-            host = SSHHost("ubuntu@gpu.example")
+            host = SSHProvider(SSHHost("ubuntu@gpu.example"))
             self.assertEqual(host.deployment_list(), [])
         self.assertEqual(run.call_args.kwargs["input"], "{}")
         self.assertIn("list", run.call_args.args[0][-1])
@@ -377,7 +390,7 @@ class DeploymentTransportTests(unittest.TestCase):
         )
         with patch("inference_platform.ssh.subprocess.run", side_effect=error):
             with self.assertRaisesRegex(RuntimeError, "SSH connection/authentication failed") as raised:
-                SSHHost("ubuntu@gpu.example").deployment_list()
+                SSHProvider(SSHHost("ubuntu@gpu.example")).deployment_list()
         self.assertIn("Operation timed out", str(raised.exception))
         self.assertNotIn("very-large-embedded-remote-script", str(raised.exception))
 
@@ -385,7 +398,7 @@ class DeploymentTransportTests(unittest.TestCase):
         error = subprocess.TimeoutExpired(["ssh", "very-large-embedded-remote-script"], timeout=240)
         with patch("inference_platform.ssh.subprocess.run", side_effect=error):
             with self.assertRaisesRegex(RuntimeError, "list on ubuntu@gpu.example timed out"):
-                SSHHost("ubuntu@gpu.example").deployment_list()
+                SSHProvider(SSHHost("ubuntu@gpu.example")).deployment_list()
 
 
 class RemoteDeploymentTests(unittest.TestCase):

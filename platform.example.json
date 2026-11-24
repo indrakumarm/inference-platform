@@ -1,0 +1,11 @@
+{
+  "target": "targets/lab-a.json",
+  "deployment": "deployment.json",
+  "gateway": {
+    "mode": "https",
+    "listen": {"host": "127.0.0.1", "port": 8443},
+    "tls": {"server_name": "inference.example.internal"},
+    "ca_file": "gateway-lab.pem",
+    "fetch_lab_certificate": true
+  }
+}

@@ -35,7 +35,8 @@ In another terminal, run `curl -fsS http://127.0.0.1:8000/v1/models`.
 
 | Guide | What it covers |
 |---|---|
+| [Infrastructure](docs/infra.md) | AWS and Vast instance lifecycle and target handoff |
 | [Deployment](docs/deployment.md) | Host preparation, profile settings, container lifecycle and troubleshooting |
-| [NGINX gateway](docs/gateway.md) | HTTPS and bearer auth, streaming verification, timing logs and backend pools |
+| [NGINX gateway](docs/gateway.md) | Guided setup, HTTPS and bearer auth, streaming verification, timing logs and backend pools |
 | [Prometheus monitoring](docs/monitoring.md) | Private metrics access, target registration via SSH and EC2 discovery |
 | [Development and findings](docs/development.md) | Tests, module boundaries and results from earlier experiments |

@@ -2,11 +2,15 @@ import contextlib
 from copy import deepcopy
 import io
 import json
+from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from inference_platform import cli, remote
+from inference_platform.providers import parse_target
+from inference_platform.providers.ssh import SSHProvider
 from inference_platform.ssh import SSHHost
 from inference_platform.ubuntu import plan
 
@@ -25,6 +29,13 @@ def report():
                    "docker_info": result("runc nvidia"), "containers": result(),
                    "docker_active": result("active")},
     }
+
+
+def fake_provider():
+    """A mocked provider that still applies the real Ubuntu readiness planner."""
+    host = Mock()
+    host.plan.side_effect = plan
+    return host
 
 
 class PlanningTests(unittest.TestCase):
@@ -74,10 +85,10 @@ class PlanningTests(unittest.TestCase):
 
 class WorkflowTests(unittest.TestCase):
     def invoke(self, operation, facts=None, confirmation=None, terminal=True):
-        host = Mock()
+        host = fake_provider()
         host.inspect.return_value = facts or report()
         output = io.StringIO()
-        with patch("inference_platform.cli.SSHHost", return_value=host), \
+        with patch("inference_platform.cli.create_provider", return_value=host), \
                 patch("inference_platform.cli.sys.stdin.isatty", return_value=terminal), \
                 patch("builtins.input", return_value=confirmation) as prompt, \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -121,9 +132,9 @@ class WorkflowTests(unittest.TestCase):
         original = report()
         changed = deepcopy(original)
         changed["checks"]["gpu_processes"]["stdout"] = "1234 another-job"
-        host = Mock()
+        host = fake_provider()
         host.inspect.side_effect = [original, changed]
-        with patch("inference_platform.cli.SSHHost", return_value=host), \
+        with patch("inference_platform.cli.create_provider", return_value=host), \
                 patch("inference_platform.cli.sys.stdin.isatty", return_value=True), \
                 patch("builtins.input", return_value="prepare ubuntu@gpu.example"), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -131,11 +142,11 @@ class WorkflowTests(unittest.TestCase):
         host.prepare.assert_not_called()
 
     def test_preparation_failure_is_not_reported_as_ready(self):
-        host = Mock()
+        host = fake_provider()
         host.inspect.return_value = report()
         host.prepare.side_effect = subprocess.CalledProcessError(1, ["ssh"])
         output = io.StringIO()
-        with patch("inference_platform.cli.SSHHost", return_value=host), \
+        with patch("inference_platform.cli.create_provider", return_value=host), \
                 patch("inference_platform.cli.sys.stdin.isatty", return_value=True), \
                 patch("builtins.input", return_value="prepare ubuntu@gpu.example"), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -146,10 +157,10 @@ class WorkflowTests(unittest.TestCase):
         original = report()
         missing_runtime = deepcopy(original)
         missing_runtime["checks"]["docker_info"]["stdout"] = "runc"
-        host = Mock()
+        host = fake_provider()
         host.inspect.side_effect = [original, original, missing_runtime]
         output = io.StringIO()
-        with patch("inference_platform.cli.SSHHost", return_value=host), \
+        with patch("inference_platform.cli.create_provider", return_value=host), \
                 patch("inference_platform.cli.sys.stdin.isatty", return_value=True), \
                 patch("builtins.input", return_value="prepare ubuntu@gpu.example"), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -158,11 +169,66 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("Host runtime ready:", output.getvalue())
 
 
+class TargetTests(unittest.TestCase):
+    def write_target(self, directory, **fields):
+        key = Path(directory) / "lab.pem"
+        key.write_text("")
+        known_hosts = Path(directory) / "known_hosts"
+        known_hosts.write_text("")
+        target = Path(directory) / "targets" / "lab.json"
+        target.parent.mkdir()
+        data = {"host": "ubuntu@gpu.example", "port": 2222,
+                "key": "../lab.pem", "known_hosts": "../known_hosts", **fields}
+        target.write_text(json.dumps(data))
+        return target, key, known_hosts
+
+    def test_target_file_selects_provider_and_connection_with_pinned_host_keys(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("inference_platform.ssh.subprocess.run") as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            target, key, known_hosts = self.write_target(directory)
+            run.return_value.stdout = json.dumps(report())
+            self.assertEqual(cli.main(["inspect", "--target", str(target)]), 0)
+        command = run.call_args.args[0]
+        self.assertIn("StrictHostKeyChecking=yes", command)
+        self.assertIn(f"UserKnownHostsFile={known_hosts.resolve()}", command)
+        self.assertEqual(command[command.index("-i") + 1], str(key.resolve()))
+        self.assertEqual(command[command.index("-p") + 1], "2222")
+        self.assertEqual(command[-2], "ubuntu@gpu.example")
+
+    def test_known_hosts_flag_pins_host_keys_for_direct_host_arguments(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("inference_platform.ssh.subprocess.run") as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            known_hosts = Path(directory) / "known_hosts"
+            known_hosts.write_text("")
+            run.return_value.stdout = json.dumps(report())
+            code = cli.main(["inspect", "--host", "ubuntu@gpu.example", "--provider", "ssh",
+                             "--known-hosts", str(known_hosts)])
+        self.assertEqual(code, 0)
+        self.assertIn(f"UserKnownHostsFile={known_hosts}", run.call_args.args[0])
+
+    def test_target_file_rejects_unknown_fields_providers_and_conflicting_flags(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                contextlib.redirect_stderr(io.StringIO()):
+            target, _, _ = self.write_target(directory, provider="vastai")
+            self.assertEqual(cli.main(["inspect", "--target", str(target)]), 1)
+            for data in ({"host": "ubuntu@gpu.example", "runtime": "docker"},
+                         {"port": 22}, {"host": "ubuntu@gpu.example", "port": "22"}):
+                with self.subTest(data=data), self.assertRaises(ValueError):
+                    parse_target(data)
+            for argv in (["inspect", "--target", str(target), "--host", "ubuntu@gpu.example"],
+                         ["inspect", "--target", str(target), "--port", "22"],
+                         ["inspect"]):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    cli.main(argv)
+
+
 class TransportAndRemoteTests(unittest.TestCase):
     def test_transport_checks_host_keys_and_sends_payload_without_shell(self):
         with patch("inference_platform.ssh.subprocess.run") as run:
             run.return_value.stdout = json.dumps(report())
-            host = SSHHost("ubuntu@gpu.example")
+            host = SSHProvider(SSHHost("ubuntu@gpu.example"))
             self.assertEqual(host.inspect(), report())
             command = run.call_args.args[0]
             self.assertIn("StrictHostKeyChecking=yes", command)
@@ -180,7 +246,7 @@ class TransportAndRemoteTests(unittest.TestCase):
         with patch.dict("os.environ", {"INFERENCE_PLATFORM_LOG_LEVEL": "DEBUG"}), \
                 patch("inference_platform.ssh.subprocess.run") as run:
             run.return_value.stdout = json.dumps(report())
-            host = SSHHost("ubuntu@gpu.example")
+            host = SSHProvider(SSHHost("ubuntu@gpu.example"))
             host.inspect()
         self.assertIn("INFERENCE_PLATFORM_LOG_LEVEL=DEBUG", run.call_args.args[0][-1])
 
@@ -191,7 +257,7 @@ class TransportAndRemoteTests(unittest.TestCase):
         for text in ("login banner\n{}", "[]", '{"schema": 2}'):
             with patch("inference_platform.ssh.subprocess.run", return_value=Mock(stdout=text)):
                 with self.assertRaises(ValueError):
-                    SSHHost("ubuntu@gpu.example").inspect()
+                    SSHProvider(SSHHost("ubuntu@gpu.example")).inspect()
 
     def test_remote_probe_missing_command_is_explicit(self):
         with patch("inference_platform.remote.subprocess.run", side_effect=FileNotFoundError("missing")):

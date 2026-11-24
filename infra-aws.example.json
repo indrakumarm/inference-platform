@@ -1,0 +1,15 @@
+{
+  "name": "lab-a",
+  "profile": "default",
+  "region": "us-east-1",
+  "instance_type": "g6.xlarge",
+  "market": "ondemand",
+  "root_gb": 200,
+  "ami_ssm": "/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id",
+  "subnet_id": "subnet-REPLACE",
+  "security_group_ids": ["sg-REPLACE"],
+  "key_name": "REPLACE",
+  "key": "~/.ssh/REPLACE.pem",
+  "known_hosts": "~/.ssh/known_hosts",
+  "private_ip": false
+}

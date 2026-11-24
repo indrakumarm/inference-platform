@@ -5,3 +5,10 @@ aws/.state
 aws/.state.*
 aws/.known_hosts
 aws/.known_hosts.legacy
+infra-aws.json
+targets/
+.env
+.env.*
+!.env.example
+.bearer-token
+platform.json

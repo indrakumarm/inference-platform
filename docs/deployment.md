@@ -8,7 +8,8 @@ Operator machine: Python 3.10+ and OpenSSH client. No third-party Python package
 are required. Run the following from this project's directory; installation is
 optional (`python3 -m pip install -e .`).
 
-Host: Linux with Python 3, SSH access and a trusted SSH host key already in
+For the default `ssh` provider, the host requires Linux with Python 3, SSH
+access and a trusted SSH host key already in
 `known_hosts`. For automatic preparation, use a **dedicated** Ubuntu 22.04/24.04
 x86_64 systemd host with a functioning NVIDIA driver and root or passwordless
 sudo. Inspection reports missing prerequisites; unsupported hosts can still be
@@ -51,6 +52,92 @@ deployment succeeded or was cancelled; 2 readiness/confirmation blocked;
 An inspection without blockers is **eligible for preparation**, not proof of
 GPU passthrough. Both `prepare` and `deploy` verify passthrough with a container.
 
+## Providers and targets
+
+Every command runs against a **provider**: an adapter that knows how a kind of
+GPU host is inspected, prepared and how vLLM runs on it. The default provider
+is `ssh`: a dedicated Ubuntu host you reach over SSH, running vLLM in rootful
+Docker. The `vastai` provider runs vLLM as a process in a Vast container.
+
+The connection can be given either with flags (`--host`, `--port`, `--key`,
+`--known-hosts`) or as a JSON **target** file. The target file is the handoff
+from whatever created the machine (a cloud script, a provider CLI) to this tool:
+
+For this repository's Python AWS provisioning commands, see
+[Infrastructure CLI](infra.md). Infra creates the machine; the commands here
+continue to manage only host readiness and the inference workload.
+
+```json
+{
+  "provider": "ssh",
+  "host": "ubuntu@10.0.1.10",
+  "port": 22,
+  "key": "~/.ssh/lab.pem",
+  "known_hosts": ".known_hosts/lab-a"
+}
+```
+
+Only `host` is required. Relative `key`/`known_hosts` paths resolve against
+the target file's directory. `--target` cannot be combined with the individual
+connection flags.
+
+```bash
+python3 -m inference_platform inspect --target targets/lab-a.json
+python3 -m inference_platform deploy --target targets/lab-a.json --profile deployment.json
+```
+
+`known_hosts` (or `--known-hosts`) selects the file SSH checks the host key
+against; host-key checking itself is never relaxed. Use it when a per-instance
+known_hosts file was recorded at provisioning time instead of
+`~/.ssh/known_hosts`.
+
+## Vast container workloads
+
+After Vast reports the instance running, export its target as described in
+[Infrastructure CLI](infra.md#vastai-container-infrastructure). Verify its
+SSH host key through a trusted channel before connecting. The Vast instance
+must already contain Python 3, PyTorch with working CUDA, `nvidia-smi`, and the
+`vllm` executable. No Docker daemon, systemd, sudo or package installation is
+required inside the container.
+
+```bash
+python3 -m inference_platform inspect --target targets/vast.json
+python3 -m inference_platform deploy --target targets/vast.json --profile deployment.json
+python3 -m inference_platform list --target targets/vast.json
+python3 -m inference_platform status --target targets/vast.json --profile deployment.json
+python3 -m inference_platform stop --target targets/vast.json --profile deployment.json
+python3 -m inference_platform start --target targets/vast.json --profile deployment.json
+python3 -m inference_platform remove --target targets/vast.json --profile deployment.json
+```
+
+`prepare` checks prerequisites but makes no changes. Deployment checks visible
+GPUs through PyTorch, free GPU memory, idle compute processes, free Hugging
+Face cache filesystem space, available `/dev/shm` and loopback port availability. Vast
+assigns shared memory at provisioning; choose an appropriate instance or
+adjust the profile only after checking model requirements. The workload image
+was chosen at instance creation: the adapter **cannot verify the running image
+digest from inside the container**. Compare the provider's instance image
+with the profile before confirming deployment.
+
+The adapter starts a detached vLLM process and checks both model identity and
+generation. The endpoint binds only to `127.0.0.1`; use an SSH tunnel, not a
+public Vast port mapping. `private_bind_ip`, Prometheus registration and
+gateway setup are not supported for Vast workloads. Process start and restart
+are manual; stopping or restarting the instance never automatically restarts
+the model. `stop` and `remove` above affect only the model process and record,
+not the billable instance. Remove retains the model cache and logs.
+
+State and logs live under `~/.local/state/inference-platform/vast/<name>/`
+inside the container. `vllm.log` contains model output and `supervisor.log`
+contains supervisor failures. Use the original deployment profile for
+lifecycle commands. If status is `unknown` or `orphaned`, the adapter refuses
+to signal or remove the process: inspect the logs and processes manually before
+reconciling. Process signalling requires Linux pidfd support. Local locks cover
+only this state directory, not other users or external processes; use a
+dedicated container and avoid concurrent external workload changes. `list
+--json` retains the existing `container` field for compatibility, but it names
+a process deployment for Vast.
+
 ## Deployment profile
 
 Create a JSON file with these required fields (replace placeholders with values
@@ -86,6 +173,9 @@ and generation demonstrate that this exact deployment starts, but do not
 replace a workload-specific capacity/performance evaluation.
 
 ## How deployment works
+
+The following describes the default Ubuntu/Docker `ssh` provider. For Vast,
+see [Vast container workloads](#vast-container-workloads).
 
 ```text
 inspect -> explicit confirmation -> optional host preparation -> GPU verification

@@ -8,6 +8,109 @@ and streams `POST /v1/chat/completions` to vLLM on `127.0.0.1:8000` on that
 same host. The default profile is for operator testing over SSH and does not
 enable TLS or authentication. Use the HTTPS profile below for VPN clients.
 
+## Guided setup and verification
+
+For a reusable configuration, copy [`platform.example.json`](../platform.example.json)
+to `platform.json` and edit the target and gateway settings:
+
+```bash
+cp platform.example.json platform.json
+python3 -m inference_platform gateway setup --config platform.json
+python3 -m inference_platform gateway verify --config platform.json
+```
+
+`platform.json` has three sections:
+
+- `target`: a target JSON path, or an inline target object using the existing
+  target schema. A path is useful for AWS targets because infra can refresh the
+  address after an instance restart.
+- `deployment`: a deployment JSON path, or an inline deployment-profile object
+  with the same fields and validation as `deployment.json`.
+- `gateway`: `mode` (`http` or `https`), `listen.host` and `listen.port`; HTTPS
+  also requires `tls.server_name`. Optional `client_port` changes only the
+  verification client's port, e.g. for an SSH tunnel. Missing gateway settings
+  are prompted for interactively. Unknown settings are rejected.
+
+Paths are relative to the platform file. For HTTPS, `ca_file` is a local public
+certificate/CA path; set it to `null` to use system trust. If omitted, setup or
+verify asks interactively. With a complete config and token, `gateway verify`
+can run without a terminal; setup still requires interactive confirmation.
+
+For a self-signed lab certificate, `fetch_lab_certificate: true` and a
+`ca_file` path let verification retrieve **only the public certificate** from
+the gateway over host-key-checked SSH if the local file doesn't exist. This
+explicitly trusts the certificate obtained from that SSH host. The file is
+created with mode `0600`; an existing file is never overwritten or silently
+updated. Verification still checks the certificate's hostname and validity.
+Create the parent directory first. For CA-issued certificates, leave
+`fetch_lab_certificate` false and use the CA file or system trust instead.
+
+For now, the optional `.env` beside `platform.json` can contain
+`API_TOKEN=<64 lowercase hex characters>`. A process environment `API_TOKEN`
+takes precedence. Alternatively pass `--env-file PATH` to setup or verify.
+The loader reads assignments as data, never executes shell commands or expands
+variables, and only uses `API_TOKEN`. If no token is supplied, interactive
+commands prompt without echo; non-interactive HTTPS verification fails.
+Keep `.env` private and untracked; never put tokens or private keys in the JSON.
+The config describes the gateway and deployment, not current instance state.
+
+The existing commands still work without `--config`:
+
+When the gateway and vLLM are on the **same SSH host**, use the existing target
+and deployment profile instead of creating another gateway JSON:
+
+```bash
+python3 -m inference_platform gateway setup \
+  --target targets/lab-a.json --deployment-profile deployment.json
+```
+
+Setup asks for local HTTP or HTTPS. It uses the model and loopback backend port
+from the deployment profile, checks that NGINX is active and that vLLM reports
+the expected model, previews the generated config, and asks before changing
+anything. NGINX must already be installed, running and using `conf.d/*.conf`.
+The generated gateway uses one local backend, `max_in_flight=1`, a 5-second
+connect timeout and a 120-second upstream read timeout. Use the lower-level
+gateway profile commands below for a separate gateway, multiple backends or
+different limits. Setup replaces the existing **managed** gateway site; it
+refuses to overwrite an unmanaged site.
+
+HTTP listens only on the gateway host's loopback interface and provides no
+authentication. Other users/processes on that host can access it. HTTPS asks
+for a loopback or private listener and a DNS name; it can reuse existing
+credentials or create a 30-day self-signed lab certificate and token after
+confirmation. Existing credential files are never overwritten. Check that
+existing credentials match the chosen name. Setup does not install NGINX,
+enroll SSH host keys, configure DNS, or open firewall/security-group ports.
+Store the token in a secrets manager; it is not saved locally by setup.
+With the legacy flags, optional `.env` is read from the current directory;
+`--env-file` selects another path. The prompted token and environment token
+are never passed as command arguments.
+
+After deployment, setup offers a streaming check from the **client machine**.
+To repeat this without redeploying or a separate gateway profile:
+
+```bash
+python3 -m inference_platform gateway verify \
+  --target targets/lab-a.json --deployment-profile deployment.json
+```
+
+Verification asks for HTTP/HTTPS and the listener details. For HTTP, first
+establish an SSH tunnel to the remote loopback listener; enter the local
+tunnel port when prompted. For HTTPS, the DNS name must resolve from the
+client, the network must allow the connection, and the certificate must be
+trusted. For a self-signed lab certificate, retrieve its public certificate
+over trusted SSH as described below, then enter its local path. Verification
+checks unauthenticated `401` and authenticated streaming for HTTPS; for HTTP it
+checks streaming only. Both require generated text and `[DONE]`. The backend
+model-list check during setup is not a generation test.
+
+If verification is skipped, setup reports the gateway deployed but unverified.
+If credential creation or deployment fails/interruption occurs, inspect the
+host before retrying: created credentials may remain, and a reload may have
+been attempted. Rerunning can reuse existing credentials; it does not rotate
+them. Keep credentials and token values out of profiles, command arguments,
+logs and version control.
+
 ## Render and deploy
 
 From the repo root on your workstation, render the config from
