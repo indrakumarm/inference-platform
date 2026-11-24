@@ -115,12 +115,7 @@ def check_bind(host, port):
     return ""
 
 
-def deployment_inspect(profile):
-    logger.info("Collecting deployment preflight facts")
-    validate(profile)
-    prefix = docker_prefix()
-    info = probe((prefix or []) + DOCKER + ["info", "--format", "{{.ID}}"]) if prefix is not None else {
-        "code": 1, "stdout": "", "stderr": "root or passwordless sudo is required"}
+def gpu_facts():
     gpu = probe(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
                  "--format=csv,noheader,nounits"])
     gpus = []
@@ -137,6 +132,22 @@ def deployment_inspect(profile):
             gpus = []
     processes = probe(["nvidia-smi", "--query-compute-apps=pid,process_name",
                        "--format=csv,noheader"])
+    return {
+        "gpu_error": (gpu["stderr"] or f"nvidia-smi exited {gpu['code']}") if gpu["code"] != 0 else "",
+        "gpus": gpus,
+        "gpu_process_error": (processes["stderr"] or f"nvidia-smi exited {processes['code']}")
+        if processes["code"] != 0 else "",
+        "gpu_processes": processes["stdout"].splitlines(),
+    }
+
+
+def deployment_inspect(profile):
+    logger.info("Collecting deployment preflight facts")
+    validate(profile)
+    prefix = docker_prefix()
+    info = probe((prefix or []) + DOCKER + ["info", "--format", "{{.ID}}"]) if prefix is not None else {
+        "code": 1, "stdout": "", "stderr": "root or passwordless sudo is required"}
+    gpu = gpu_facts()
     containers = probe((prefix or []) + DOCKER + ["ps", "--format", "{{.Names}}"]) if prefix is not None else {
         "code": 1, "stdout": "", "stderr": "root or passwordless sudo is required"}
     all_containers = probe((prefix or []) + DOCKER + ["ps", "-a", "--format", "{{.Names}}"]) if prefix is not None else {
@@ -155,10 +166,7 @@ def deployment_inspect(profile):
     return {
         "docker_ready": info["code"] == 0,
         "docker_error": info["stderr"],
-        "gpu_error": gpu["stderr"] if gpu["code"] != 0 else "",
-        "gpus": gpus,
-        "gpu_process_error": processes["stderr"] if processes["code"] != 0 else "",
-        "gpu_processes": processes["stdout"].splitlines(),
+        **gpu,
         "container_error": (containers["stderr"] if containers["code"] != 0
                             else all_containers["stderr"] if all_containers["code"] != 0 else ""),
         "running_containers": containers["stdout"].splitlines(),
@@ -231,6 +239,29 @@ def require_ready(profile):
         raise RuntimeError("Deployment preflight blocked: " + " ".join(blocked))
 
 
+def check_model(profile):
+    endpoint = f"http://127.0.0.1:{profile['port']}"
+    with urllib.request.urlopen(endpoint + "/v1/models", timeout=10) as response:
+        models = json.loads(response.read())
+    ids = [entry["id"] for entry in models.get("data", [])]
+    if profile["model"] not in ids:
+        raise RuntimeError(f"Served model identity mismatch: expected {profile['model']}, got {ids}")
+    request = urllib.request.Request(
+        endpoint + "/v1/completions",
+        data=json.dumps({"model": profile["model"], "prompt": "Reply with ready.",
+                         "max_tokens": 8, "temperature": 0}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        generation = json.loads(response.read())
+    text = generation["choices"][0]["text"]
+    if not isinstance(text, str) or not text.strip():
+        raise RuntimeError("Generation smoke test returned empty text")
+    return {"endpoint": endpoint + "/v1", "model": profile["model"],
+            "generation_smoke_test": "passed"}
+
+
 def wait_for_model(profile, container):
     endpoint = f"http://127.0.0.1:{profile['port']}"
     logger.info("Waiting for model API identity and generation checks at %s", endpoint)
@@ -244,25 +275,7 @@ def wait_for_model(profile, container):
             raise RuntimeError("vLLM container exited before readiness: " +
                                (logs["stdout"] or logs["stderr"] or state["stderr"]))
         try:
-            with urllib.request.urlopen(endpoint + "/v1/models", timeout=10) as response:
-                models = json.loads(response.read())
-            ids = [entry["id"] for entry in models.get("data", [])]
-            if profile["model"] not in ids:
-                raise RuntimeError(f"Served model identity mismatch: expected {profile['model']}, got {ids}")
-            request = urllib.request.Request(
-                endpoint + "/v1/completions",
-                data=json.dumps({"model": profile["model"], "prompt": "Reply with ready.",
-                                 "max_tokens": 8, "temperature": 0}).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=60) as response:
-                generation = json.loads(response.read())
-            text = generation["choices"][0]["text"]
-            if not isinstance(text, str) or not text.strip():
-                raise RuntimeError("Generation smoke test returned empty text")
-            return {"endpoint": endpoint + "/v1", "model": profile["model"],
-                    "generation_smoke_test": "passed"}
+            return check_model(profile)
         except RuntimeError:
             raise
         except (OSError, ValueError, KeyError, IndexError, urllib.error.URLError) as error:

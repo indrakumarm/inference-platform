@@ -40,20 +40,34 @@ def _check_auth(hostname, port, context, timeout):
         connection.close()
 
 
+def check_http_gateway(hostname, port, model, timeout):
+    previous_handler = signal.signal(signal.SIGALRM, _deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        return _check_stream(hostname, port, None, model, None, timeout)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def _check_stream(hostname, port, context, model, token, timeout):
     body = json.dumps({
         "model": model, "messages": [{"role": "user", "content": "Reply with OK."}],
         "max_tokens": 64, "temperature": 0, "stream": True,
     }).encode()
-    connection = http.client.HTTPSConnection(hostname, port, context=context, timeout=timeout)
+    if context is None:
+        connection = http.client.HTTPConnection(hostname, port, timeout=timeout)
+    else:
+        connection = http.client.HTTPSConnection(hostname, port, context=context, timeout=timeout)
     start = time.monotonic()
     try:
-        connection.request("POST", _CHAT, body=body, headers={
-            "Content-Type": "application/json", "Authorization": f"Bearer {token}",
-        })
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        connection.request("POST", _CHAT, body=body, headers=headers)
         with connection.getresponse() as response:
             if response.status != 200:
-                raise RuntimeError(f"Authenticated stream: expected HTTP 200, got {response.status}")
+                raise RuntimeError(f"Stream check: expected HTTP 200, got {response.status}")
             if response.headers.get_content_type() != "text/event-stream":
                 raise RuntimeError("Authenticated request did not return an SSE stream")
             return _read_stream(response, start)

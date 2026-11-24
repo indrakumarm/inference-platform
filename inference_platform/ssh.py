@@ -12,9 +12,14 @@ logger = logging.getLogger(__name__)
 
 
 class SSHHost:
-    """SSH transport; remote operations are supplied by the host adapter."""
+    """SSH transport for remote Python payloads.
 
-    def __init__(self, target, key=None, port=22):
+    GPU-host workload operations live in ``providers``; this class only knows how to
+    reach a host and run a command with a stdin payload. The small monitoring and
+    gateway helpers below target hosts that are not managed by a provider.
+    """
+
+    def __init__(self, target, key=None, port=22, known_hosts=None):
         if not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]*@[a-zA-Z0-9][a-zA-Z0-9.-]*", target):
             raise ValueError("Host must be user@hostname or user@IPv4 (no SSH options)")
         if not 1 <= port <= 65535:
@@ -25,19 +30,19 @@ class SSHHost:
                         "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
                         "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
                         "-p", str(port)]
+        if known_hosts:
+            path = Path(known_hosts).expanduser()
+            if not path.is_file():
+                raise ValueError(f"known_hosts file not found: {path}")
+            self.command.extend(["-o", f"UserKnownHostsFile={path}"])
         if key:
             path = Path(key).expanduser()
             if not path.is_file():
                 raise ValueError(f"SSH key file not found: {path}")
             self.command.extend(["-i", str(path)])
         self.command.append(target)
-        logging_source = Path(__file__).with_name("logging_config.py").read_text()
-        self.source = (logging_source + "\n" +
-                       Path(__file__).with_name("remote.py").read_text())
-        self.deployment_source = (logging_source + "\n" +
-                                 Path(__file__).with_name("remote_deploy.py").read_text())
 
-    def _run_ssh(self, operation, remote_command, payload, timeout, **options):
+    def run(self, operation, remote_command, payload, timeout, **options):
         try:
             return subprocess.run(
                 [*self.command, remote_command], input=payload,
@@ -66,70 +71,31 @@ class SSHHost:
                 message += "\n" + detail
             raise RuntimeError(message) from error
 
-    def inspect(self):
-        logger.info("Inspecting remote host %s", self.target)
-        command = shlex.join(["env", f"INFERENCE_PLATFORM_LOG_LEVEL={self.log_level}",
-                              "python3", "-", "inspect"])
-        logger.debug("Starting read-only host inspection over SSH")
-        result = self._run_ssh("inspect", command, self.source, timeout=240,
-                               capture_output=True)
-        try:
-            report = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise ValueError("Host did not return JSON; check Python 3 and SSH login output") from error
-        if not isinstance(report, dict) or report.get("schema") != 1:
-            raise ValueError("Unsupported host report format")
-        logger.debug("Received remote host inspection report")
-        return report
-
-    def prepare(self, actions, root):
-        logger.info("Preparing remote host %s with actions: %s", self.target, actions)
-        command = ([] if root else ["sudo", "-n", "--"]) + [
-            "env", f"INFERENCE_PLATFORM_LOG_LEVEL={self.log_level}",
-            "python3", "-", "prepare", *actions]
-        self._run_ssh("prepare", shlex.join(command), self.source, timeout=2400)
-        logger.info("Remote host preparation command completed")
-
-    def _deployment_call(self, operation, profile, timeout):
-        logger.info("Starting remote deployment %s on %s", operation, self.target)
-        remote_command = shlex.join([
-            "env", f"INFERENCE_PLATFORM_LOG_LEVEL={self.log_level}",
-            "python3", "-c", self.deployment_source, operation])
-        output_options = ({"stdout": subprocess.PIPE} if operation == "deploy"
-                         else {"capture_output": True})
-        result = self._run_ssh(operation, remote_command, json.dumps(profile),
-                               timeout=timeout, **output_options)
-        try:
-            response = json.loads(result.stdout.splitlines()[-1])
-        except (IndexError, json.JSONDecodeError) as error:
-            raise ValueError("Host did not return a valid deployment response") from error
-        logger.debug("Received remote deployment %s response", operation)
-        return response
-
-    def deployment_inspect(self, profile):
-        return self._deployment_call("inspect", profile, timeout=240)
-
-    def deployment_list(self):
-        return self._deployment_call("list", {}, timeout=240)
-
-    def deploy(self, profile):
-        return self._deployment_call("deploy", profile, timeout=7200)
-
-    def lifecycle(self, operation, profile):
-        return self._deployment_call(operation, profile, timeout=300)
-
     def update_monitoring_target(self, action, ip, port, name):
         source = Path(__file__).with_name("remote_monitoring.py").read_text()
         command = shlex.join(["python3", "-c", source, action])
         payload = json.dumps({"ip": ip, "port": port, "name": name})
         logger.info("Updating Prometheus target %s:%s on %s (%s)", ip, port, self.target, action)
-        self._run_ssh(f"monitoring target {action}", command, payload, timeout=30, capture_output=True)
+        self.run(f"monitoring target {action}", command, payload, timeout=30, capture_output=True)
 
     def gateway_deploy(self, config):
         self._gateway_call("deploy", config)
 
     def gateway_bootstrap_tls(self, server_name, token):
         self._gateway_call("bootstrap-tls", json.dumps({"server_name": server_name, "token": token}))
+
+    def gateway_inspect(self, port, model):
+        result = self._gateway_call("inspect", json.dumps({"port": port, "model": model}))
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError("Gateway host did not return a valid inspection response") from error
+        if not isinstance(response, dict) or type(response.get("credentials_exist")) is not bool:
+            raise ValueError("Gateway host returned an invalid inspection response")
+        return response
+
+    def gateway_certificate(self):
+        return self._gateway_call("certificate", "").stdout
 
     def _gateway_call(self, action, payload):
         source = (Path(__file__).with_name("logging_config.py").read_text() + "\n" +
@@ -139,4 +105,4 @@ class SSHHost:
             "python3", "-c", source, action,
         ])
         logger.info("Starting remote gateway %s on %s", action, self.target)
-        self._run_ssh(f"gateway {action}", command, payload, timeout=120, stdout=subprocess.PIPE)
+        return self.run(f"gateway {action}", command, payload, timeout=120, stdout=subprocess.PIPE)

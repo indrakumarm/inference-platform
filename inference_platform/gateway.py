@@ -161,6 +161,17 @@ def gateway_main(argv):
     bootstrap = commands.add_parser(
         "bootstrap-tls", help="Provision a self-signed lab certificate and bearer token over SSH")
     check = commands.add_parser("check", help="Verify HTTPS, authentication and streaming from this client")
+    setup = commands.add_parser("setup", help="Guided gateway setup and client verification")
+    setup.add_argument("--target", type=Path, help="SSH target JSON")
+    setup.add_argument("--deployment-profile", type=Path,
+                       help="Model deployment JSON for this host")
+    verify = commands.add_parser("verify", help="Guided client-side gateway verification")
+    verify.add_argument("--target", type=Path, help="Gateway host target JSON")
+    verify.add_argument("--deployment-profile", type=Path,
+                        help="Model deployment JSON")
+    for command in (setup, verify):
+        command.add_argument("--config", type=Path, help="Combined platform JSON")
+        command.add_argument("--env-file", type=Path, help="Token file (default: .env beside config)")
     check.add_argument("--ca-file", type=Path, help="Trusted CA or public lab certificate (default: system trust)")
     check.add_argument("--model", required=True, help="Client-visible vLLM model ID")
     check.add_argument("--timeout", type=int, default=30, help="Total check deadline in seconds (default: 30)")
@@ -171,6 +182,17 @@ def gateway_main(argv):
         command.add_argument("--key", help="SSH private key path; otherwise use SSH agent/config")
         command.add_argument("--port", type=int, default=22, help="SSH port")
     args = parser.parse_args(argv)
+    if args.operation in ("setup", "verify"):
+        from .gateway_setup import setup_gateway, verify_gateway
+        if args.config and (args.target or args.deployment_profile):
+            parser.error("--config cannot be combined with --target or --deployment-profile")
+        if not args.config and not (args.target and args.deployment_profile):
+            parser.error("provide --config or both --target and --deployment-profile")
+        if args.operation == "setup":
+            return setup_gateway(args.target, args.deployment_profile,
+                                 config_path=args.config, env_file=args.env_file)
+        return verify_gateway(args.target, args.deployment_profile,
+                              config_path=args.config, env_file=args.env_file)
     try:
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
         config = render_gateway(profile)

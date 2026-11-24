@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 
 SITE = Path("/etc/nginx/conf.d/inference-platform.conf")
@@ -32,6 +33,35 @@ def run_checked(command):
 
 def deploy_gateway(config):
     _with_gateway_lock(_install_site, MANAGED + config)
+
+
+def inspect_gateway(payload):
+    port = payload.get("port")
+    model = payload.get("model")
+    if type(port) is not int or not 1024 <= port <= 65535 or not isinstance(model, str):
+        raise ValueError("Invalid backend inspection request")
+    if not SITE.parent.is_dir():
+        raise RuntimeError(f"{SITE.parent} is missing; install and configure NGINX first")
+    run_checked(["systemctl", "is-active", "--quiet", "nginx"])
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=10) as response:
+            data = json.load(response)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"Cannot inspect vLLM at 127.0.0.1:{port}: {error}") from error
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise RuntimeError("vLLM returned an invalid model list")
+    if not any(isinstance(item, dict) and item.get("id") == model for item in data["data"]):
+        raise RuntimeError(f"vLLM does not report the expected model {model}")
+    return {"credentials_exist": os.path.lexists(TLS_DIR)}
+
+
+def public_certificate():
+    certificate = TLS_DIR / "fullchain.pem"
+    if not stat.S_ISREG(certificate.lstat().st_mode):
+        raise RuntimeError("Gateway certificate must be a regular file")
+    if certificate.stat().st_size > 65536:
+        raise RuntimeError("Gateway certificate is too large")
+    return certificate.read_text(encoding="ascii")
 
 
 def _with_gateway_lock(operation, payload):
@@ -151,6 +181,10 @@ if __name__ == "__main__":
             deploy_gateway(sys.stdin.buffer.read())
         elif operation == "bootstrap-tls":
             bootstrap_tls(json.load(sys.stdin))
+        elif operation == "inspect":
+            print(json.dumps(inspect_gateway(json.load(sys.stdin))))
+        elif operation == "certificate":
+            print(public_certificate(), end="")
         else:
             raise ValueError("Expected deploy or bootstrap-tls")
     except (OSError, RuntimeError, ValueError) as error:
